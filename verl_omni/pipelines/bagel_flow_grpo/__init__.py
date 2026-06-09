@@ -20,8 +20,13 @@ from .diffusers_training_adapter import BagelFlowGRPO
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# NOTE: BagelPipelineWithLogProb is not yet functional. The vllm-omni
-# rollout adapter for Bagel image generation will be exported here
-# once implemented.
+try:
+    from .vllm_omni_rollout_adapter import BagelPipelineWithLogProb
+except ImportError:
+    BagelPipelineWithLogProb = None
+    logger.debug(
+        "BagelPipelineWithLogProb not loaded (vllm_omni unavailable). "
+        "Set PYTHONPATH to include the vllm-omni source directory to enable it."
+    )
 
-__all__ = ["BagelFlowGRPO"]
+__all__ = ["BagelFlowGRPO", "BagelPipelineWithLogProb"]

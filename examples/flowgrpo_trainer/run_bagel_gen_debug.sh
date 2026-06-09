@@ -14,8 +14,7 @@
 #   - architecture must be set explicitly (no model_index.json for transformers models)
 #   - fsdp_layer_prefixes target the LLM decoder layers, not diffusers transformer_blocks
 #   - transformer_subfolder is empty (Bagel is a single-model checkpoint)
-#   - The rollout adapter is not yet implemented; this script only demonstrates
-#     the training-side configuration
+#   - vllm-omni must be on PYTHONPATH (the rollout adapter imports from it)
 #
 # Usage:
 #   NUM_GPUS=4 bash examples/flowgrpo_trainer/run_bagel_gen_debug.sh
@@ -23,6 +22,10 @@
 set -x
 
 WORKSPACE=${WORKSPACE:-$HOME}
+
+# vllm-omni source (needed by the Bagel rollout adapter)
+VLLM_OMNI_DIR=${VLLM_OMNI_DIR:-$HOME/caoziqi/code/experiment/vllm-omni}
+export PYTHONPATH="${VLLM_OMNI_DIR}:${PYTHONPATH:-}"
 
 # Data paths (adjust to your training data)
 train_data_path=$WORKSPACE/data/bagel_gen/train.parquet
