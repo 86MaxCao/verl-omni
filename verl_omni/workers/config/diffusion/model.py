@@ -135,7 +135,10 @@ class DiffusionModelConfig(BaseConfig):
                 self.architecture = json.load(f)["_class_name"]
 
         if self.transformer_config is None:
-            config_path = os.path.join(self.local_path, "transformer", "config.json")
+            if self.transformer_subfolder:
+                config_path = os.path.join(self.local_path, self.transformer_subfolder, "config.json")
+            else:
+                config_path = os.path.join(self.local_path, "config.json")
             if os.path.isfile(config_path):
                 try:
                     with open(config_path) as f:

@@ -13,6 +13,12 @@
 # limitations under the License.
 """Entrypoint for diffusion model RL training."""
 
+# pyarrow must be imported before vllm to avoid jemalloc segfault
+try:
+    import pyarrow  # noqa: F401
+except ImportError:
+    pass
+
 import os
 import socket
 

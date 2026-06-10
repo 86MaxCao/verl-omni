@@ -97,3 +97,9 @@ change and explain why**.
 ## Acknowledgements
 
 Adapted from the [verl project](https://github.com/verl-project/verl)'s [`AGENTS.md`](https://github.com/verl-project/verl/blob/main/AGENTS.md), which was itself adapted from the [vLLM project](https://github.com/vllm-project/vllm).
+
+
+# 注意事项
+- 本项目有多个 3000+ 行的大文件，不要一次性读取整个文件
+- 先用 grep 定位相关代码，再用 offset/limit 分段读取
+- 优先用子 Agent 做代码搜索，避免撑满上下文

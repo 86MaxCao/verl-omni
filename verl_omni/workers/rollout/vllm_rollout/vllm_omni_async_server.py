@@ -14,6 +14,8 @@
 import argparse
 import logging
 import os
+import sys
+import types
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -21,6 +23,22 @@ import numpy as np
 import ray
 import torch
 import torchvision.transforms as T
+
+# Stub missing vllm modules that vllm-omni references but don't exist in
+# the installed vllm version. This avoids ImportError when the entrypoints
+# module chain tries to import them eagerly.
+for _mod_name in [
+    "vllm.entrypoints.speech_to_text",
+    "vllm.entrypoints.speech_to_text.realtime",
+    "vllm.entrypoints.speech_to_text.realtime.serving",
+    "vllm.entrypoints.speech_to_text.transcription",
+    "vllm.entrypoints.speech_to_text.transcription.serving",
+    "vllm.entrypoints.speech_to_text.translation",
+    "vllm.entrypoints.speech_to_text.translation.serving",
+]:
+    if _mod_name not in sys.modules:
+        sys.modules[_mod_name] = types.ModuleType(_mod_name)
+
 import vllm_omni.entrypoints.cli.serve
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs

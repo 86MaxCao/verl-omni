@@ -13,6 +13,9 @@ path: ~/models/Qwen/Qwen-Image
 # RL algorithm name
 algorithm: flow_grpo
 
+# Model architecture class name. Auto-detected from model_index.json if null.
+architecture: null
+
 # path to the huggingface tokenizer. In case it is not the same as path
 tokenizer_path: null
 

@@ -49,7 +49,7 @@ def jpeg_compressibility():
     return _fn
 
 
-def compute_score(solution_image):
+def compute_score(solution_image, **kwargs):
     """The scoring function for JPEG compressibility.
 
     Args:

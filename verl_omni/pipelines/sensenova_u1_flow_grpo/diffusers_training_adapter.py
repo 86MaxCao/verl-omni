@@ -68,6 +68,10 @@ class SenseNovaU1(DiffusionModelBase):
             trust_remote_code=True,
             torch_dtype=torch_dtype,
         )
+        # FSDP engine calls enable_gradient_checkpointing() (diffusers convention),
+        # but HuggingFace models use gradient_checkpointing_enable().
+        if not hasattr(model, "enable_gradient_checkpointing"):
+            model.enable_gradient_checkpointing = model.gradient_checkpointing_enable
         return model
 
     # -- scheduler -----------------------------------------------------------
@@ -133,13 +137,20 @@ class SenseNovaU1(DiffusionModelBase):
 
         # current image state from latent trajectory
         # latents shape: (B, T, 3, H, W) — pixel-space images
-        image_prediction = latents[:, step]
+        param_dtype = next(module.parameters()).dtype
+        image_prediction = latents[:, step].to(param_dtype)
         B = image_prediction.shape[0]
         device = image_prediction.device
         dtype = image_prediction.dtype
 
-        # current timestep (scalar per sample)
-        t = timesteps[:, step]  # (B,)
+        if prompt_embeds is not None:
+            prompt_embeds = prompt_embeds.to(param_dtype)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds.to(param_dtype)
+
+        # current timestep — rollout stores pairs [t_current, t_next]
+        ts = timesteps[:, step]
+        t = (ts[:, 0] if ts.dim() == 2 else ts).to(param_dtype)  # (B,)
 
         # patchify at full resolution for z (flow target)
         z = module.patchify(image_prediction, patch_size * merge_size)  # (B, L, D_patch)
@@ -317,7 +328,7 @@ class SenseNovaU1(DiffusionModelBase):
             scheduler.sample_previous_step(
                 sample=sample_z,
                 model_output=noise_pred.float(),
-                timestep=timesteps[:, step],
+                timestep=timesteps[:, step, 0] if timesteps.dim() == 3 else timesteps[:, step],
                 noise_level=model_config.algo.noise_level,
                 prev_sample=prev_z,
                 sde_type=model_config.algo.sde_type,

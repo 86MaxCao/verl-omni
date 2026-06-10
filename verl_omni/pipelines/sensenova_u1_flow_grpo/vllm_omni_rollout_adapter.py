@@ -26,10 +26,12 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import (
     COND,
     IDX_COND,
+    IDX_IMG_COND,
     IDX_UNCOND,
     IMG_COND,
     IMG_START_TOKEN,
     MASK_COND,
+    MASK_IMG_COND,
     MASK_UNCOND,
     SYSTEM_MESSAGE_FOR_GEN,
     THINK_OFF,
@@ -67,7 +69,7 @@ def _coalesce(*values):
     return None
 
 
-@VllmOmniPipelineBase.register("SenseNovaU1Pipeline", algorithm="flow_grpo")
+@VllmOmniPipelineBase.register("NEOChatModel", algorithm="flow_grpo")
 class SenseNovaU1PipelineWithLogProb(SenseNovaU1Pipeline):
     """SenseNova-U1 rollout pipeline with SDE log-prob collection for FlowGRPO."""
 
@@ -104,6 +106,7 @@ class SenseNovaU1PipelineWithLogProb(SenseNovaU1Pipeline):
         scheduler.timesteps = ns.timesteps[:-1]
         scheduler.sigmas = 1.0 - ns.timesteps
         scheduler.set_begin_index(0)
+        scheduler._step_index = 0
 
         all_latents: list[torch.Tensor] = []
         all_log_probs: list[torch.Tensor] = []
@@ -219,14 +222,23 @@ class SenseNovaU1PipelineWithLogProb(SenseNovaU1Pipeline):
         return image_prediction, all_latents, all_log_probs, all_timesteps
 
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
-        """End-to-end T2I generation with SDE log-prob collection.
+        """End-to-end T2I/IT2I generation with SDE log-prob collection.
 
         Overrides the base class ``forward`` to replace the ODE denoising
         loop with an SDE loop and collect per-step latents, log-probs, and
         timesteps for FlowGRPO RL training.
+
+        Automatically routes to IT2I path when input images are present.
         """
         p = self._parse_request(req)
+        input_images = self._extract_input_images(p.first_prompt)
 
+        if input_images is not None:
+            return self._forward_it2i_sde(p, input_images)
+        return self._forward_t2i_sde(p)
+
+    def _forward_t2i_sde(self, p) -> DiffusionOutput:
+        """Text-to-image SDE generation with log-prob collection."""
         extra = p.extra_args if hasattr(p, "extra_args") else {}
         noise_level = extra.get("noise_level", 1.0)
         sde_window_size = extra.get("sde_window_size", None)
@@ -282,25 +294,13 @@ class SenseNovaU1PipelineWithLogProb(SenseNovaU1Pipeline):
         }
 
         generator = torch.Generator(device=self.device).manual_seed(p.seed)
-
-        if sde_window_size is not None:
-            start = torch.randint(
-                sde_window_range[0],
-                sde_window_range[1] - sde_window_size + 1,
-                (1,),
-                generator=generator,
-                device=self.device,
-            ).item()
-            end = start + sde_window_size
-            sde_window = (start, end)
-        else:
-            sde_window = (0, p.num_steps - 1)
+        sde_window = self._compute_sde_window(
+            p, sde_window_size, sde_window_range, generator
+        )
 
         image_prediction, all_latents, all_log_probs, all_timesteps = (
             self.diffuse(
-                ns,
-                caches,
-                p,
+                ns, caches, p,
                 noise_level=noise_level,
                 sde_window=sde_window,
                 sde_type=sde_type,
@@ -327,8 +327,128 @@ class SenseNovaU1PipelineWithLogProb(SenseNovaU1Pipeline):
             device=negative_prompt_embeds.device,
         )
 
-        image = _denorm(image_prediction)
+        return self._build_output(
+            image_prediction, all_latents, all_log_probs, all_timesteps,
+            prompt_embeds, prompt_embeds_mask,
+            negative_prompt_embeds, negative_prompt_embeds_mask,
+        )
 
+    def _forward_it2i_sde(self, p, input_images) -> DiffusionOutput:
+        """Image-to-image SDE generation with log-prob collection."""
+        extra = p.extra_args if hasattr(p, "extra_args") else {}
+        noise_level = extra.get("noise_level", 1.0)
+        sde_window_size = extra.get("sde_window_size", None)
+        sde_window_range = extra.get("sde_window_range", (0, p.num_steps - 1))
+        sde_type = extra.get("sde_type", "sde")
+        logprobs = extra.get("logprobs", True)
+
+        ns = self._init_noise_and_schedule(p)
+
+        pixel_values, grid_hw = self._prepare_input_images(input_images)
+        images_info = {"grid_hw": grid_hw, "pixel_values": pixel_values}
+
+        # Condition: full prompt + input images
+        query_cond = self._build_it2i_query(p.prompt, images_info, False)
+        embeds_cond, idx_cond, mask_cond = self._build_it2i_inputs(
+            query_cond, pixel_values, grid_hw
+        )
+
+        # Uncondition: empty prompt, no images
+        query_uncond = _build_t2i_query("", append_text=IMG_START_TOKEN)
+        embeds_uncond, idx_uncond, mask_uncond = self._build_it2i_inputs(
+            query_uncond
+        )
+
+        # Prefix forward for condition (it2i uses embeds, not input_ids)
+        past_kv_cond, _ = self._it2i_prefix_forward(
+            embeds_cond, idx_cond, mask_cond
+        )
+        idx_image_cond = self._build_t2i_image_indexes(
+            ns.token_h, ns.token_w,
+            idx_cond[0].max().item() + 1,
+            self.device,
+        )
+
+        past_kv_uncond, _ = self._it2i_prefix_forward(
+            embeds_uncond, idx_uncond, mask_uncond
+        )
+        idx_image_uncond = self._build_t2i_image_indexes(
+            ns.token_h, ns.token_w,
+            idx_uncond[0].max().item() + 1,
+            self.device,
+        )
+
+        self._expand_and_prepare_kv(
+            past_kv_cond, ns.token_h * ns.token_w, p.batch_size
+        )
+        self._expand_and_prepare_kv(
+            past_kv_uncond, ns.token_h * ns.token_w, p.batch_size
+        )
+
+        caches = {
+            COND: past_kv_cond,
+            IDX_COND: idx_image_cond,
+            MASK_COND: {"full_attention": None},
+            UNCOND: past_kv_uncond,
+            IDX_UNCOND: idx_image_uncond,
+            MASK_UNCOND: {"full_attention": None},
+        }
+
+        generator = torch.Generator(device=self.device).manual_seed(p.seed)
+        sde_window = self._compute_sde_window(
+            p, sde_window_size, sde_window_range, generator
+        )
+
+        image_prediction, all_latents, all_log_probs, all_timesteps = (
+            self.diffuse(
+                ns, caches, p,
+                noise_level=noise_level,
+                sde_window=sde_window,
+                sde_type=sde_type,
+                logprobs=logprobs,
+                generator=generator,
+            )
+        )
+
+        # prompt_embeds for training: the condition embeddings (with image)
+        prompt_embeds = embeds_cond
+        prompt_embeds_mask = torch.ones(
+            prompt_embeds.shape[:2],
+            dtype=torch.bool,
+            device=prompt_embeds.device,
+        )
+
+        negative_prompt_embeds = embeds_uncond
+        negative_prompt_embeds_mask = torch.ones(
+            negative_prompt_embeds.shape[:2],
+            dtype=torch.bool,
+            device=negative_prompt_embeds.device,
+        )
+
+        return self._build_output(
+            image_prediction, all_latents, all_log_probs, all_timesteps,
+            prompt_embeds, prompt_embeds_mask,
+            negative_prompt_embeds, negative_prompt_embeds_mask,
+        )
+
+    def _compute_sde_window(self, p, sde_window_size, sde_window_range, generator):
+        if sde_window_size is not None:
+            start = torch.randint(
+                sde_window_range[0],
+                sde_window_range[1] - sde_window_size + 1,
+                (1,),
+                generator=generator,
+                device=self.device,
+            ).item()
+            return (start, start + sde_window_size)
+        return (0, p.num_steps - 1)
+
+    def _build_output(
+        self, image_prediction, all_latents, all_log_probs, all_timesteps,
+        prompt_embeds, prompt_embeds_mask,
+        negative_prompt_embeds, negative_prompt_embeds_mask,
+    ) -> DiffusionOutput:
+        image = _denorm(image_prediction)
         return DiffusionOutput(
             output=_maybe_to_cpu(image),
             custom_output={
