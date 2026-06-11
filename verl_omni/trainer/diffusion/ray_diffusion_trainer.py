@@ -673,11 +673,19 @@ class BaseRayDiffusionTrainer(ABC):
         # to stream reward computation with actor rollout
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
 
-        self.llm_server_manager = LLMServerManager.create(
-            config=self.config,
-            worker_group=self.actor_rollout_wg,
-            rollout_resource_pool=actor_rollout_resource_pool,
-        )
+        import traceback as _tb
+        print("[DEBUG] _init_online_rollout_stack: about to create LLMServerManager", flush=True)
+        try:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
+            print("[DEBUG] _init_online_rollout_stack: LLMServerManager created successfully", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] _init_online_rollout_stack: LLMServerManager.create FAILED: {e}", flush=True)
+            _tb.print_exc()
+            raise
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(),

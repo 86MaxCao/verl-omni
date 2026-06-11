@@ -14,6 +14,7 @@
 
 """Bagel-specific constants and utilities for FlowGRPO training."""
 
+import numpy as np
 import torch
 
 # Bagel VAE scale factor: downsample=8 (from BagelVaeConfig default)
@@ -78,6 +79,71 @@ def compute_bagel_shifted_sigmas(num_inference_steps: int, timestep_shift: float
         sigmas = sigmas_shifted.numpy()
 
     return sigmas
+
+
+def patchify_for_vit(image_tensor: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Patchify an image tensor for ViT input.
+
+    Converts a (C, H, W) tensor into (num_patches, patch_size^2 * C) patches.
+
+    Args:
+        image_tensor: Image tensor of shape (C, H, W).
+        patch_size: Size of each patch.
+
+    Returns:
+        Flattened patches of shape (num_patches, patch_size^2 * C).
+    """
+    C, H, W = image_tensor.shape
+    h = H // patch_size
+    w = W // patch_size
+    patches = image_tensor[:, :h * patch_size, :w * patch_size]
+    patches = patches.reshape(C, h, patch_size, w, patch_size)
+    patches = patches.permute(1, 3, 2, 4, 0)  # (h, w, p, p, C)
+    patches = patches.reshape(h * w, patch_size * patch_size * C)
+    return patches
+
+
+def resize_image_to_stride(image, stride: int, max_size: int, min_size: int = 256):
+    """Resize a PIL image so dimensions are multiples of stride within bounds.
+
+    Args:
+        image: PIL.Image input.
+        stride: Target stride alignment.
+        max_size: Maximum allowed dimension.
+        min_size: Minimum allowed dimension.
+
+    Returns:
+        Resized PIL.Image.
+    """
+    from PIL import Image as PILImage
+
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    w, h = image.size
+    scale = min(max_size / max(w, h), 1.0)
+    scale = max(scale, min_size / min(w, h))
+    new_w = max(stride, int(round(w * scale / stride) * stride))
+    new_h = max(stride, int(round(h * scale / stride) * stride))
+    new_w = min(new_w, max_size)
+    new_h = min(new_h, max_size)
+    if new_w != w or new_h != h:
+        image = image.resize((new_w, new_h), PILImage.BICUBIC)
+    return image
+
+
+def image_to_vae_input(image) -> torch.Tensor:
+    """Convert a PIL image to VAE input tensor in [-1, 1].
+
+    Args:
+        image: PIL.Image in RGB mode.
+
+    Returns:
+        Tensor of shape (C, H, W) in [-1, 1].
+    """
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    arr = torch.from_numpy(np.array(image)).float() / 127.5 - 1.0
+    return arr.permute(2, 0, 1)
 
 
 def get_flattened_position_ids(H, W, patch_size, max_num_patches_per_side):

@@ -14,6 +14,7 @@
 import argparse
 import logging
 import os
+import traceback
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -21,7 +22,6 @@ import numpy as np
 import ray
 import torch
 import torchvision.transforms as T
-import vllm_omni.entrypoints.cli.serve
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
 from verl.utils.net_utils import get_free_port
@@ -89,6 +89,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         return "verl_omni.workers.rollout.vllm_rollout.utils.vLLMOmniColocateWorkerExtension"
 
     def _get_cli_modules(self) -> list:
+        import vllm_omni.entrypoints.cli.serve
         return [vllm_omni.entrypoints.cli.serve]
 
     def _get_cli_description(self) -> str:
@@ -102,6 +103,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         attribute to None, so the default is not applied and launch crashes with
         ``replica_rank + None``. Training rollout seeding stays unset via meta_info.
         """
+        import sys
+        print(f"[DEBUG] vLLMOmniHttpServer.launch_server called, replica_rank={self.replica_rank}, node_rank={self.node_rank}", flush=True)
+        print(f"[DEBUG] vLLMOmniHttpServer.launch_server called", file=sys.stderr, flush=True)
         original_get = self.config.get
 
         def get_with_engine_seed_default(key: str, default: Any = None) -> Any:
@@ -113,6 +117,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         self.config.get = get_with_engine_seed_default
         try:
             await super().launch_server(master_address, master_port, dp_rpc_port)
+            print(f"[DEBUG] vLLMOmniHttpServer.launch_server completed successfully, replica_rank={self.replica_rank}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] vLLMOmniHttpServer.launch_server FAILED with exception: {e}", flush=True)
+            traceback.print_exc()
+            raise
         finally:
             # BaseConfig is frozen; pop the shadowed get instead of reassigning it.
             self.config.__dict__.pop("get", None)
@@ -122,34 +131,70 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # -----------------------------------------------------------------------
 
     async def run_server(self, args: argparse.Namespace):
-        engine_args = OmniEngineArgs.from_cli_args(args)
-        engine_args = asdict(engine_args)
+        import sys
+        print(f"[DEBUG] vLLMOmniHttpServer.run_server START, replica_rank={self.replica_rank}", flush=True)
+        try:
+            engine_args = OmniEngineArgs.from_cli_args(args)
+            engine_args = asdict(engine_args)
+            print(f"[DEBUG] run_server: engine_args parsed", flush=True)
 
-        import_external_libs(self.config.external_lib)
-        pipeline_path = VllmOmniPipelineBase.get_pipeline_path(
-            architecture=self.model_config.architecture,
-            algorithm=self.model_config.algorithm,
-        )
-        # TODO (mike): read custom_pipeline from engine_args
-        if pipeline_path is not None:
-            engine_args["enable_dummy_pipeline"] = True
-            engine_args["custom_pipeline_args"] = {"pipeline_class": pipeline_path}
+            import_external_libs(self.config.external_lib)
+            pipeline_path = VllmOmniPipelineBase.get_pipeline_path(
+                architecture=self.model_config.architecture,
+                algorithm=self.model_config.algorithm,
+            )
+            print(f"[DEBUG] run_server: pipeline_path={pipeline_path}", flush=True)
+            # TODO (mike): read custom_pipeline from engine_args
+            if pipeline_path is not None:
+                engine_args["enable_dummy_pipeline"] = True
+                engine_args["custom_pipeline_args"] = {"pipeline_class": pipeline_path}
 
-        diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
-        diffusion_master_sock.close()
+            diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
+            diffusion_master_sock.close()
 
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(diffusion_master_port)
-        logger.info("Using MASTER_PORT=%s for vLLM-Omni diffusion workers", os.environ["MASTER_PORT"])
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(diffusion_master_port)
+            logger.info("Using MASTER_PORT=%s for vLLM-Omni diffusion workers", os.environ["MASTER_PORT"])
 
-        # Apply before AsyncOmni builds OmniDiffusionConfig in this process.
-        VLLMOmniHijack.hijack()
-        engine_client = AsyncOmni(**engine_args)
-        app = build_app(args)
-        await omni_init_app_state(engine_client, app.state, args)
+            # Apply before AsyncOmni builds OmniDiffusionConfig in this process.
+            VLLMOmniHijack.hijack()
+            # For RL training with a custom pipeline, use the single-stage
+            # deploy config so we skip the heavyweight LLM stage init.
+            if engine_args.get("enable_dummy_pipeline"):
+                import json as _json
+                model_path = engine_args.get("model", "")
+                config_json = os.path.join(model_path, "config.json")
+                if os.path.isfile(config_json):
+                    with open(config_json) as _f:
+                        _model_type = _json.load(_f).get("model_type", "")
+                    import vllm_omni as _vo
+                    _ss = os.path.join(os.path.dirname(_vo.__file__), "deploy", f"{_model_type}_single_stage.yaml")
+                    if os.path.isfile(_ss):
+                        engine_args["deploy_config"] = _ss
+                        print(f"[DEBUG] run_server: using single-stage deploy config: {_ss}", flush=True)
+            engine_args["init_timeout"] = 1800
+            engine_args["stage_init_timeout"] = 900
+            print(f"[DEBUG] run_server: init_timeout={engine_args.get('init_timeout')}, "
+                  f"stage_init_timeout={engine_args.get('stage_init_timeout')}, "
+                  f"deploy_config={engine_args.get('deploy_config', 'NONE')}, "
+                  f"model={engine_args.get('model', 'NONE')}", flush=True)
+            print(f"[DEBUG] run_server: about to create AsyncOmni engine", flush=True)
+            engine_client = AsyncOmni(**engine_args)
+            print(f"[DEBUG] run_server: AsyncOmni engine created", flush=True)
+            app = build_app(args)
+            print(f"[DEBUG] run_server: app built, about to init app state", flush=True)
+            await omni_init_app_state(engine_client, app.state, args)
+            print(f"[DEBUG] run_server: app state initialized", flush=True)
 
-        self.engine = engine_client
-        self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+            self.engine = engine_client
+            self._server_port, self._server_task = await run_uvicorn(app, args, self._server_address)
+            print(f"[DEBUG] run_server: uvicorn running on port {self._server_port}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] vLLMOmniHttpServer.run_server FAILED: {e}", flush=True)
+            print(f"[DEBUG] Full traceback:", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            traceback.print_exc()
+            raise
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
@@ -280,6 +325,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         negative_prompt_embeds_mask = mm_output.get("negative_prompt_embeds_mask")
         latents_clean = mm_output.get("latents_clean")
         train_timesteps = mm_output.get("train_timesteps")
+        # Bagel i2i condition embeddings (optional)
+        cond_vae_embeds = mm_output.get("cond_vae_embeds")
+        cond_vit_embeds = mm_output.get("cond_vit_embeds")
 
         # TODO(andy): refactor later.
         extra_fields = {
@@ -293,6 +341,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             "negative_prompt_embeds_mask": negative_prompt_embeds_mask[0]
             if negative_prompt_embeds_mask is not None
             else None,
+            "cond_vae_embeds": cond_vae_embeds[0] if cond_vae_embeds is not None else None,
+            "cond_vit_embeds": cond_vit_embeds[0] if cond_vit_embeds is not None else None,
             "global_steps": self.global_steps,
         }
 

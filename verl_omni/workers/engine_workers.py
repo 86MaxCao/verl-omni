@@ -615,6 +615,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 2. build actor model
         if "actor" in self.role:
+            # Strip mbridge_config injected by verl's Hydra config merging —
+            # base CheckpointConfig does not accept it (only McoreCheckpointConfig does).
+            if "checkpoint" in self.config.actor and "mbridge_config" in self.config.actor.checkpoint:
+                from omegaconf import open_dict
+
+                with open_dict(self.config.actor):
+                    del self.config.actor.checkpoint.mbridge_config
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
             distillation_config: Optional[DistillationConfig] = (

@@ -32,6 +32,7 @@ that ``vllm_omni.diffusion.*`` imports resolve at runtime.
 
 import logging
 import os
+from collections.abc import Iterable
 from typing import Any, Literal, Optional
 
 import torch
@@ -52,7 +53,10 @@ from .common import (
     compute_bagel_shifted_sigmas,
     coalesce_not_none,
     get_flattened_position_ids,
+    image_to_vae_input,
     maybe_to_cpu,
+    patchify_for_vit,
+    resize_image_to_stride,
 )
 
 __all__ = ["BagelPipelineWithLogProb"]
@@ -65,8 +69,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _try_load_vae(model_path: str, device: torch.device):
-    """Attempt to load the Bagel FLUX-style VAE from ``ae.safetensors``."""
+def _try_load_vae(model_path: str, device: torch.device, vae_config=None):
+    """Attempt to load the Bagel FLUX-style VAE from ``ae.safetensors``.
+
+    The ``AutoEncoder`` class lives in the model's remote-code module
+    (``modeling_bagel.py``), not in a separate ``modeling.autoencoder``
+    package.  We import it via the same trust_remote_code mechanism that
+    loaded the main model.
+
+    Args:
+        model_path: Path to the Bagel model directory.
+        device: Target device for the VAE.
+        vae_config: Optional ``BagelVaeConfig`` from the loaded model.
+            When provided, it is used directly to construct the AutoEncoder.
+    """
     vae_path = os.path.join(model_path, "ae.safetensors")
     if not os.path.exists(vae_path):
         logger.warning("VAE not found at %s; image decode unavailable.", vae_path)
@@ -75,32 +91,46 @@ def _try_load_vae(model_path: str, device: torch.device):
         from safetensors.torch import load_file as load_sft
 
         sd = load_sft(vae_path)
+
+        # Import AutoEncoder from the model's trust_remote_code module.
+        # The class is defined in modeling_bagel.py alongside the main model.
+        AutoEncoder = None
+        BagelVaeConfig = None
         try:
-            # The AutoEncoder class ships with the official Bagel repository.
-            # When the model is loaded with trust_remote_code=True the module
-            # may already be on ``sys.path``; otherwise set PYTHONPATH to include
-            # the Bagel source tree.
-            from modeling.autoencoder import AutoEncoder, AutoEncoderParams
+            import importlib
+
+            mod = importlib.import_module("transformers_modules.modeling_bagel")
+            AutoEncoder = getattr(mod, "AutoEncoder", None)
+            BagelVaeConfig = getattr(mod, "BagelVaeConfig", None)
         except ImportError:
-            logger.warning(
-                "Cannot import AutoEncoder from modeling.autoencoder. "
-                "Set PYTHONPATH to include the Bagel source directory, or "
-                "skip VAE decode by using output_type='latent'."
-            )
-            return None
-        ae_params = AutoEncoderParams(
-            resolution=256,
-            in_channels=3,
-            downsample=8,
-            ch=128,
-            out_ch=3,
-            ch_mult=[1, 2, 4, 4],
-            num_res_blocks=2,
-            z_channels=16,
-            scale_factor=0.3611,
-            shift_factor=0.1159,
-        )
-        ae = AutoEncoder(ae_params)
+            pass
+
+        if AutoEncoder is None:
+            # Fallback: try the model directory's own modeling_bagel.
+            import sys
+
+            if model_path not in sys.path:
+                sys.path.insert(0, model_path)
+            try:
+                from modeling_bagel import AutoEncoder as _AE  # type: ignore
+
+                AutoEncoder = _AE
+            except ImportError:
+                logger.warning(
+                    "Cannot import AutoEncoder from modeling_bagel. "
+                    "VAE encode/decode will be unavailable."
+                )
+                return None
+
+        if vae_config is None:
+            # Construct BagelVaeConfig from defaults (matching BagelVaeConfig defaults).
+            if BagelVaeConfig is not None:
+                vae_config = BagelVaeConfig()
+            else:
+                logger.warning("BagelVaeConfig not found; VAE load skipped.")
+                return None
+
+        ae = AutoEncoder(vae_config)
         ae.load_state_dict(sd, strict=False, assign=True)
         return ae.eval().to(device)
     except Exception as e:
@@ -114,7 +144,7 @@ def _try_load_vae(model_path: str, device: torch.device):
 
 
 @VllmOmniPipelineBase.register("BagelForConditionalGeneration", algorithm="flow_grpo")
-class BagelPipelineWithLogProb:
+class BagelPipelineWithLogProb(torch.nn.Module):
     """Standalone rollout pipeline for Bagel flow-matching image generation.
 
     Loads the full ``BagelForConditionalGeneration`` model (including
@@ -133,21 +163,21 @@ class BagelPipelineWithLogProb:
     """
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__()
         self.device = get_local_device()
         model_path = od_config.model
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
+
+        from transformers import AutoModelForCausalLM
 
         logger.info("Loading Bagel model from %s for FlowGRPO rollout", model_path)
-        self.model = (
-            AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-            )
-            .eval()
-            .to(self.device)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
         )
+        self.model = model.eval().to(self.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         for tok in ["<|vision_start|>", "<|vision_end|>"]:
@@ -169,12 +199,52 @@ class BagelPipelineWithLogProb:
         self.patch_latent_dim = getattr(self.model, "patch_latent_dim", BAGEL_PATCH_LATENT_DIM)
         self.use_moe = getattr(self.model, "use_moe", True)
 
-        self.vae_model = _try_load_vae(model_path, self.device)
+        self.vae_model = _try_load_vae(
+            model_path, self.device, vae_config=getattr(self.model.config, "vae_config", None)
+        )
+
+        # i2i: ViT-related components (from the loaded model if visual_und=True)
+        self.has_vit = hasattr(self.model, "vit_model") and self.model.vit_model is not None
+        if self.has_vit:
+            self.vit_patch_size = getattr(self.model, "vit_patch_size", 14)
+            self.vit_max_num_patch_per_side = getattr(self.model, "vit_max_num_patch_per_side", 70)
+            try:
+                from transformers import SiglipImageProcessor
+
+                self.image_processor = SiglipImageProcessor.from_pretrained(model_path, local_files_only=True)
+            except Exception:
+                self.image_processor = None
+                logger.warning("SiglipImageProcessor not loaded; i2i may not work.")
+        else:
+            self.image_processor = None
+            logger.info("ViT model not found on BagelForConditionalGeneration; i2i disabled.")
 
         self.scheduler = FlowMatchSDEDiscreteScheduler(num_train_timesteps=1000, shift=1.0)
 
         self._interrupt = False
         self._current_timestep = None
+
+    # ------------------------------------------------------------------
+    # Weight sync (called by vllm-omni DiffusionModelRunner and initial load)
+    # ------------------------------------------------------------------
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        param_dict = dict(self.model.named_parameters())
+        buf_dict = dict(self.model.named_buffers())
+        all_keys = {**param_dict, **buf_dict}
+        loaded = set()
+        for name, tensor in weights:
+            clean = name
+            for pfx in ("transformer.", "module.", "model."):
+                if clean.startswith(pfx):
+                    clean = clean[len(pfx):]
+                    break
+            if clean in all_keys:
+                all_keys[clean].data.copy_(tensor)
+                loaded.add(clean)
+        if loaded:
+            logger.info("BagelPipelineWithLogProb.load_weights: updated %d params", len(loaded))
+        return loaded
 
     # ------------------------------------------------------------------
     # Properties expected by vllm-omni pipeline interface
@@ -234,6 +304,116 @@ class BagelPipelineWithLogProb:
         return prompt_embeds, mask
 
     # ------------------------------------------------------------------
+    # Condition image encoding (i2i)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def encode_condition_image(
+        self,
+        image,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode a condition image into VAE latent embeddings and ViT embeddings.
+
+        The condition image is processed through two paths:
+        1. VAE encode → patchify → vae2llm + time_embedder(t=0) + latent_pos_embed
+        2. ViT → connector + vit_pos_embed
+
+        Args:
+            image: PIL.Image condition image.
+            height: Target height (used for VAE latent grid).
+            width: Target width (used for VAE latent grid).
+
+        Returns:
+            Tuple of (cond_vae_embeds, cond_vit_embeds):
+            - cond_vae_embeds: (1, num_vae_tokens, D) condition VAE embeddings
+            - cond_vit_embeds: (1, num_vit_tokens, D) condition ViT embeddings,
+              or None if ViT is unavailable.
+        """
+        from PIL import Image as PILImage
+
+        if isinstance(image, str):
+            image = PILImage.open(image)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Resize to match output resolution (aligned to latent_downsample)
+        stride = self.latent_downsample
+        max_size = int(self.max_latent_size * stride)
+        image = resize_image_to_stride(image, stride, max_size)
+        img_w, img_h = image.size
+
+        # --- VAE path ---
+        cond_vae_embeds = None
+        if self.vae_model is not None:
+            img_tensor = image_to_vae_input(image).to(self.device)  # (C, H, W)
+            vae_dtype = next(self.vae_model.parameters()).dtype
+            latent = self.vae_model.encode(img_tensor.unsqueeze(0).to(vae_dtype))  # (1, C, h*p, w*p)
+
+            # Patchify: (1, C, h*p, w*p) → (1, h*w, p²*C)
+            h = img_h // stride
+            w = img_w // stride
+            p = self.latent_patch_size
+            c = self.latent_channel
+            latent = latent[0]  # (C, h*p, w*p)
+            latent = latent[:, :h * p, :w * p].reshape(c, h, p, w, p)
+            latent = torch.einsum("chpwq->hwpqc", latent).reshape(h * w, p * p * c)
+
+            # Embed: vae2llm + time(0) + pos
+            vae_pos_ids = get_flattened_position_ids(
+                img_h, img_w, stride, self.max_latent_size
+            ).to(self.device)
+            zero_t = torch.zeros(h * w, device=self.device, dtype=torch.float32)
+            model_dtype = next(self.model.parameters()).dtype
+            cond_vae_embeds = (
+                self.model.vae2llm(latent.to(model_dtype))
+                + self.model.time_embedder(zero_t)
+                + self.model.latent_pos_embed(vae_pos_ids)
+            ).unsqueeze(0)  # (1, h*w, D)
+
+        # --- ViT path ---
+        cond_vit_embeds = None
+        if self.has_vit:
+            if self.image_processor is not None:
+                vit_pixel_values = self.image_processor(
+                    images=image, return_tensors="pt"
+                ).pixel_values[0]  # (C, H_vit, W_vit)
+            else:
+                import torchvision.transforms.functional as TF
+                vit_pixel_values = TF.to_tensor(image)
+
+            # Patchify for ViT
+            vit_dtype = next(self.model.vit_model.parameters()).dtype
+            vit_tokens = patchify_for_vit(vit_pixel_values, self.vit_patch_size).to(
+                device=self.device, dtype=vit_dtype
+            )
+            num_vit_tokens = vit_tokens.shape[0]
+
+            # Position IDs for ViT
+            vit_h = vit_pixel_values.shape[1]
+            vit_w = vit_pixel_values.shape[2]
+            vit_pos_ids = get_flattened_position_ids(
+                vit_h, vit_w, self.vit_patch_size, self.vit_max_num_patch_per_side
+            ).to(self.device)
+
+            # Run ViT
+            cu_seqlens = torch.tensor([0, num_vit_tokens], dtype=torch.int32, device=self.device)
+            vit_out = self.model.vit_model(
+                packed_pixel_values=vit_tokens,
+                packed_flattened_position_ids=vit_pos_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=num_vit_tokens,
+            )
+
+            # Connector + position embed
+            vit_out = self.model.connector(vit_out)
+            vit_out = vit_out + self.model.vit_pos_embed(vit_pos_ids)
+            cond_vit_embeds = vit_out.unsqueeze(0)  # (1, num_vit_tokens, D)
+
+        return cond_vae_embeds, cond_vit_embeds
+
+    # ------------------------------------------------------------------
     # Velocity prediction (matches training adapter's _bagel_flow_forward)
     # ------------------------------------------------------------------
 
@@ -246,12 +426,20 @@ class BagelPipelineWithLogProb:
         prompt_embeds_mask: torch.Tensor,
         height: int,
         width: int,
+        cond_vae_embeds: Optional[torch.Tensor] = None,
+        cond_vit_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Predict flow velocity via packed-sequence LLM forward.
 
-        Packs text embeddings and noisy VAE latent tokens into a single
-        sequence per sample, runs the LLM, and projects latent outputs to
-        VAE space via ``llm2vae``.
+        Packs condition embeddings (if i2i), text embeddings, and noisy VAE
+        latent tokens into a single sequence per sample, runs the LLM, and
+        projects latent outputs to VAE space via ``llm2vae``.
+
+        Token layout (i2i): [cond_vae | cond_vit | text | noisy_latent]
+        Token layout (t2i): [text | noisy_latent]
+
+        MoE routing:
+        - cond_vae → gen, cond_vit → und, text → und, noisy_latent → gen
 
         Args:
             x_t: ``(B, num_tokens, patch_dim)`` noisy latent tokens.
@@ -259,6 +447,8 @@ class BagelPipelineWithLogProb:
             prompt_embeds: ``(B, L, D)`` text embeddings.
             prompt_embeds_mask: ``(B, L)`` boolean mask.
             height, width: image size in pixels.
+            cond_vae_embeds: ``(B, N_vae, D)`` condition image VAE embeddings, or None.
+            cond_vit_embeds: ``(B, N_vit, D)`` condition image ViT embeddings, or None.
 
         Returns:
             ``(B, num_tokens, patch_dim)`` velocity prediction.
@@ -272,51 +462,82 @@ class BagelPipelineWithLogProb:
         ).to(device)
 
         all_packed: list[torch.Tensor] = []
-        all_text_idx: list[torch.Tensor] = []
-        all_vae_idx: list[torch.Tensor] = []
+        all_und_idx: list[torch.Tensor] = []
+        all_gen_idx: list[torch.Tensor] = []
         all_pos_ids: list[torch.Tensor] = []
+        all_latent_idx: list[torch.Tensor] = []
         sample_lens: list[int] = []
         seq_offset = 0
 
         for b in range(batch_size):
+            segments: list[torch.Tensor] = []
+            und_indices: list[int] = []
+            gen_indices: list[int] = []
+            pos_ids: list[torch.Tensor] = []
+            cursor = 0
+            pos_counter = 0
+
+            # --- Condition VAE tokens (gen MoE) ---
+            if cond_vae_embeds is not None:
+                n_cv = cond_vae_embeds.shape[1]
+                segments.append(cond_vae_embeds[b])
+                gen_indices.extend(range(seq_offset + cursor, seq_offset + cursor + n_cv))
+                pos_ids.append(torch.full((n_cv,), pos_counter, device=device, dtype=torch.long))
+                cursor += n_cv
+                pos_counter += 1
+
+            # --- Condition ViT tokens (und MoE) ---
+            if cond_vit_embeds is not None:
+                n_vit = cond_vit_embeds.shape[1]
+                segments.append(cond_vit_embeds[b])
+                und_indices.extend(range(seq_offset + cursor, seq_offset + cursor + n_vit))
+                pos_ids.append(torch.full((n_vit,), pos_counter, device=device, dtype=torch.long))
+                cursor += n_vit
+                pos_counter += 1
+
+            # --- Text tokens (und MoE) ---
             text_len = int(prompt_embeds_mask[b].sum().item())
             text_emb = prompt_embeds[b, :text_len]
+            segments.append(text_emb)
+            und_indices.extend(range(seq_offset + cursor, seq_offset + cursor + text_len))
+            pos_ids.append(torch.arange(pos_counter, pos_counter + text_len, device=device))
+            cursor += text_len
+            pos_counter += text_len
 
+            # --- Noisy latent tokens (gen MoE) ---
             t_b = timestep[b : b + 1].expand(num_latent_tokens)
             lat_emb = (
                 self.model.vae2llm(x_t[b])
                 + self.model.time_embedder(t_b)
                 + self.model.latent_pos_embed(vae_pos_ids)
             )
+            segments.append(lat_emb.to(text_emb.dtype))
+            latent_global_start = seq_offset + cursor
+            gen_indices.extend(range(latent_global_start, latent_global_start + num_latent_tokens))
+            pos_ids.append(torch.full((num_latent_tokens,), pos_counter, device=device, dtype=torch.long))
+            cursor += num_latent_tokens
 
-            total = text_len + num_latent_tokens
-            packed = text_emb.new_zeros(total, self.hidden_size)
-            packed[:text_len] = text_emb
-            packed[text_len:] = lat_emb.to(text_emb.dtype)
-
-            t_idx = torch.arange(seq_offset, seq_offset + text_len, device=device)
-            v_idx = torch.arange(seq_offset + text_len, seq_offset + total, device=device)
-
-            t_pos = torch.arange(text_len, device=device)
-            l_pos = torch.full((num_latent_tokens,), text_len, device=device, dtype=torch.long)
-
+            # --- Assemble ---
+            packed = torch.cat(segments, dim=0)
             all_packed.append(packed)
-            all_text_idx.append(t_idx)
-            all_vae_idx.append(v_idx)
-            all_pos_ids.append(torch.cat([t_pos, l_pos]))
-            sample_lens.append(total)
-            seq_offset += total
+            all_und_idx.append(torch.tensor(und_indices, device=device, dtype=torch.long))
+            all_gen_idx.append(torch.tensor(gen_indices, device=device, dtype=torch.long))
+            all_latent_idx.append(torch.arange(latent_global_start, latent_global_start + num_latent_tokens, device=device))
+            all_pos_ids.append(torch.cat(pos_ids))
+            sample_lens.append(cursor)
+            seq_offset += cursor
 
         packed_seq = torch.cat(all_packed)
-        text_indexes = torch.cat(all_text_idx)
-        vae_indexes = torch.cat(all_vae_idx)
+        und_indexes = torch.cat(all_und_idx)
+        gen_indexes = torch.cat(all_gen_idx)
+        latent_indexes = torch.cat(all_latent_idx)
         position_ids = torch.cat(all_pos_ids)
 
         extra: dict[str, Any] = {}
         if self.use_moe:
             extra = dict(
-                packed_und_token_indexes=text_indexes,
-                packed_gen_token_indexes=vae_indexes,
+                packed_und_token_indexes=und_indexes,
+                packed_gen_token_indexes=gen_indexes,
             )
 
         hidden = self.model.language_model.model(
@@ -327,7 +548,7 @@ class BagelPipelineWithLogProb:
             **extra,
         )
 
-        v_t = self.model.llm2vae(hidden[vae_indexes])
+        v_t = self.model.llm2vae(hidden[latent_indexes])
         return v_t.reshape(batch_size, num_latent_tokens, -1)
 
     # ------------------------------------------------------------------
@@ -347,6 +568,8 @@ class BagelPipelineWithLogProb:
         sde_type: str,
         generator: Optional[torch.Generator],
         logprobs: bool,
+        cond_vae_embeds: Optional[torch.Tensor] = None,
+        cond_vit_embeds: Optional[torch.Tensor] = None,
     ):
         """Run the full flow-matching denoising loop with SDE collection.
 
@@ -366,6 +589,8 @@ class BagelPipelineWithLogProb:
             sde_type: ``"sde"`` or ``"cps"``.
             generator: optional RNG for reproducibility.
             logprobs: whether to compute per-step log-probabilities.
+            cond_vae_embeds: ``(B, N, D)`` condition VAE embeddings (i2i), or None.
+            cond_vit_embeds: ``(B, N, D)`` condition ViT embeddings (i2i), or None.
 
         Returns:
             ``(x_t, all_latents, all_log_probs, all_timesteps)``
@@ -398,7 +623,11 @@ class BagelPipelineWithLogProb:
             sigma = (ts_val / 1000.0) if isinstance(ts_val, (int, float)) else (ts_val.item() / 1000.0)
             sigma_t = torch.tensor([sigma], device=self.device, dtype=torch.float32).expand(batch_size)
 
-            v_t = self._forward_velocity(x_t, sigma_t, prompt_embeds, prompt_embeds_mask, height, width)
+            v_t = self._forward_velocity(
+                x_t, sigma_t, prompt_embeds, prompt_embeds_mask, height, width,
+                cond_vae_embeds=cond_vae_embeds,
+                cond_vit_embeds=cond_vit_embeds,
+            )
 
             # Flatten for scheduler: (B, T, D) → (B, T*D)
             x_flat = x_t.float().flatten(1)
@@ -504,15 +733,26 @@ class BagelPipelineWithLogProb:
             ``"all_latents"``, ``"all_log_probs"``, ``"all_timesteps"``,
             ``"prompt_embeds"``, ``"prompt_embeds_mask"``.
         """
-        # -- Extract prompt ------------------------------------------------
+        # -- Extract prompt and condition image ----------------------------
         custom_prompt = req.prompts[0] if req.prompts else {}
         prompt_text: Optional[str] = None
+        condition_image = None
         if isinstance(custom_prompt, str):
             prompt_text = custom_prompt
         elif isinstance(custom_prompt, dict):
             prompt_ids = custom_prompt.get("prompt_ids", prompt_ids)
             prompt_mask = custom_prompt.get("prompt_mask", prompt_mask)
             prompt_text = custom_prompt.get("prompt_text", prompt_text)
+            # Extract condition image for i2i
+            multi_modal_data = custom_prompt.get("multi_modal_data", None)
+            if multi_modal_data is None:
+                extra = custom_prompt.get("extra_args", {})
+                if isinstance(extra, dict):
+                    multi_modal_data = extra.get("multi_modal_data", {})
+            if multi_modal_data:
+                condition_image = multi_modal_data.get("image") or multi_modal_data.get("img2img")
+                if isinstance(condition_image, list):
+                    condition_image = condition_image[0] if condition_image else None
 
         # -- Override defaults from sampling_params ------------------------
         sp = req.sampling_params
@@ -557,6 +797,19 @@ class BagelPipelineWithLogProb:
             prompt_embeds_mask = prompt_embeds_mask.repeat(num_images_per_prompt, 1)
             batch_size *= num_images_per_prompt
 
+        # -- Encode condition image (i2i) ----------------------------------
+        cond_vae_embeds = None
+        cond_vit_embeds = None
+        if condition_image is not None:
+            cond_vae_embeds, cond_vit_embeds = self.encode_condition_image(
+                condition_image, height, width
+            )
+            # Expand to batch
+            if cond_vae_embeds is not None and cond_vae_embeds.shape[0] == 1 and batch_size > 1:
+                cond_vae_embeds = cond_vae_embeds.expand(batch_size, -1, -1)
+            if cond_vit_embeds is not None and cond_vit_embeds.shape[0] == 1 and batch_size > 1:
+                cond_vit_embeds = cond_vit_embeds.expand(batch_size, -1, -1)
+
         # -- Prepare initial noise -----------------------------------------
         h = height // self.latent_downsample
         w = width // self.latent_downsample
@@ -597,6 +850,8 @@ class BagelPipelineWithLogProb:
                 sde_type,
                 generator,
                 logprobs,
+                cond_vae_embeds=cond_vae_embeds,
+                cond_vit_embeds=cond_vit_embeds,
             )
 
         self._current_timestep = None
@@ -607,13 +862,16 @@ class BagelPipelineWithLogProb:
         else:
             image = self._decode_latents(x_t, height, width)
 
-        return DiffusionOutput(
-            output=maybe_to_cpu(image),
-            custom_output={
-                "all_latents": maybe_to_cpu(all_latents),
-                "all_log_probs": maybe_to_cpu(all_log_probs),
-                "all_timesteps": maybe_to_cpu(all_timesteps),
-                "prompt_embeds": maybe_to_cpu(prompt_embeds),
-                "prompt_embeds_mask": maybe_to_cpu(prompt_embeds_mask),
-            },
-        )
+        custom_output = {
+            "all_latents": maybe_to_cpu(all_latents),
+            "all_log_probs": maybe_to_cpu(all_log_probs),
+            "all_timesteps": maybe_to_cpu(all_timesteps),
+            "prompt_embeds": maybe_to_cpu(prompt_embeds),
+            "prompt_embeds_mask": maybe_to_cpu(prompt_embeds_mask),
+        }
+        if cond_vae_embeds is not None:
+            custom_output["cond_vae_embeds"] = maybe_to_cpu(cond_vae_embeds)
+        if cond_vit_embeds is not None:
+            custom_output["cond_vit_embeds"] = maybe_to_cpu(cond_vit_embeds)
+
+        return DiffusionOutput(output=maybe_to_cpu(image), custom_output=custom_output)

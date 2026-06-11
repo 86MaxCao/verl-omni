@@ -9,6 +9,55 @@
 
 </div>
 
+## BAGEL FlowGRPO Adaptation
+
+This branch adds **FlowGRPO RL training support for [BAGEL-7B-MoT](https://github.com/ByteDance-Seed/Bagel)**, a unified multimodal model with Mixture-of-Transformers (MoT) architecture that jointly supports image understanding and generation.
+
+### Key Features
+
+- **Text-to-Image (t2i)**: Generate images from text prompts with RL-based optimization via FlowGRPO.
+- **Image-to-Image (it2i)**: Edit images with text instructions — the condition image is encoded via VAE + ViT and packed into the sequence alongside text and noisy latent tokens at each denoising step.
+- **Rollout/Training Consistency**: Both rollout and training use identical packed-sequence forward passes (no KV cache), ensuring log-probability consistency for RL.
+
+### Architecture
+
+Unlike pure DiT models (e.g., Qwen-Image), Bagel's flow-matching diffusion runs inside the LLM itself:
+
+- **Token layout (t2i)**: `[text | noisy_latent]`
+- **Token layout (it2i)**: `[cond_vae | cond_vit | text | noisy_latent]`
+- **MoE routing**: `cond_vae → gen`, `cond_vit → und`, `text → und`, `noisy_latent → gen`
+
+### Quick Start
+
+```bash
+# 1. Install dependencies
+pip install "vllm==0.20.2"
+pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@c7178d89bb7a70817f239febc84c3b21a714dae7"
+pip install "verl==0.8.0"
+pip install -e .
+
+# 2. Run Bagel FlowGRPO training (t2i)
+NUM_GPUS=4 bash examples/flowgrpo_trainer/run_bagel_gen_debug.sh
+
+# 3. Run e2e tests
+bash tests/special_e2e/run_flowgrpo_bagel_t2i.sh   # text-to-image
+bash tests/special_e2e/run_flowgrpo_bagel_it2i.sh   # image-to-image editing
+```
+
+### Added Files
+
+| File | Description |
+|---|---|
+| `verl_omni/pipelines/bagel_flow_grpo/common.py` | Bagel constants and utilities (patchify, sigma schedule, position IDs) |
+| `verl_omni/pipelines/bagel_flow_grpo/vllm_omni_rollout_adapter.py` | Rollout adapter: standalone pipeline with SDE log-prob collection |
+| `verl_omni/pipelines/bagel_flow_grpo/diffusers_training_adapter.py` | Training adapter: packed-sequence forward, `forward_and_sample_previous_step` |
+| `examples/flowgrpo_trainer/run_bagel_gen_debug.sh` | Example launch script for Bagel FlowGRPO training |
+| `tests/special_e2e/run_flowgrpo_bagel_t2i.sh` | E2E smoke test for t2i |
+| `tests/special_e2e/run_flowgrpo_bagel_it2i.sh` | E2E smoke test for it2i |
+| `tests/special_e2e/create_dummy_bagel_data.py` | Synthetic data generator for e2e tests |
+
+---
+
 `VeRL-Omni` is a general RL training framework focused on multimodal generative models, built on top of [`verl`](https://github.com/verl-project/verl).
 
 It originated from the multi-modal generation RL effort in `verl`, and now has a dedicated home so it can evolve in a more focused way.

@@ -282,7 +282,15 @@ class TaskRunner:
             train_sampler=train_sampler,
         )
         # Initialize the workers of the trainer.
-        trainer.init_workers()
+        import traceback as _tb
+        try:
+            print("[DEBUG] main_diffusion: calling trainer.init_workers()", flush=True)
+            trainer.init_workers()
+            print("[DEBUG] main_diffusion: init_workers() completed", flush=True)
+        except Exception as e:
+            print(f"[DEBUG] main_diffusion: init_workers() FAILED: {e}", flush=True)
+            _tb.print_exc()
+            raise
 
         # Start the training process.
         trainer.fit()

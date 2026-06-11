@@ -114,11 +114,18 @@ def _build_bagel_model_forward_inputs(
     prompt_embeds: torch.Tensor,
     prompt_embeds_mask: torch.Tensor,
     micro_batch: TensorDict,
+    cond_vae_embeds: Optional[torch.Tensor] = None,
+    cond_vit_embeds: Optional[torch.Tensor] = None,
 ) -> dict:
     """Build Bagel-specific forward inputs for flow-matching prediction.
 
-    Constructs the packed sequence with text embeddings and noisy VAE latent
-    tokens, then returns a dict that can be passed to a Bagel forward helper.
+    Constructs the packed sequence with optional condition embeddings (i2i),
+    text embeddings, and noisy VAE latent tokens.
+
+    Token layout (i2i): [cond_vae | cond_vit | text | noisy_latent]
+    Token layout (t2i): [text | noisy_latent]
+
+    MoE routing: cond_vae→gen, cond_vit→und, text→und, noisy_latent→gen
 
     Args:
         module: The BagelForConditionalGeneration model.
@@ -127,6 +134,8 @@ def _build_bagel_model_forward_inputs(
         prompt_embeds: Pre-computed text token embeddings, shape (B, L, D).
         prompt_embeds_mask: Attention mask for text tokens, shape (B, L).
         micro_batch: Micro-batch containing Bagel-specific metadata.
+        cond_vae_embeds: (B, N_vae, D) condition VAE embeddings (i2i), or None.
+        cond_vit_embeds: (B, N_vit, D) condition ViT embeddings (i2i), or None.
 
     Returns:
         Dict with all inputs for the flow-matching forward pass.
@@ -135,88 +144,100 @@ def _build_bagel_model_forward_inputs(
     device = x_t.device
     hidden_size = module.hidden_size
 
-    # Retrieve Bagel-specific metadata from micro_batch
     height = tu.get_non_tensor_data(data=micro_batch, key="height", default=512)
     width = tu.get_non_tensor_data(data=micro_batch, key="width", default=512)
 
     latent_downsample = getattr(module, "latent_downsample", BAGEL_LATENT_DOWNSAMPLE)
-    latent_patch_size = getattr(module, "latent_patch_size", BAGEL_LATENT_PATCH_SIZE)
     max_latent_size = getattr(module, "max_latent_size", BAGEL_MAX_LATENT_SIZE)
-    latent_channel = getattr(module, "latent_channel", BAGEL_LATENT_CHANNELS)
     use_moe = getattr(module, "use_moe", True)
 
     h = height // latent_downsample
     w = width // latent_downsample
     num_latent_tokens = h * w
 
-    # Build packed sequence for each sample. The packing layout per sample is:
-    # [text_tokens..., latent_tokens...]
-    # We use a simple layout where each sample's text and latent tokens are
-    # concatenated, then all samples are packed together.
     all_packed_sequences = []
-    all_packed_vae_token_indexes = []
-    all_packed_text_indexes = []
+    all_packed_und_indexes = []
+    all_packed_gen_indexes = []
+    all_packed_latent_indexes = []
     all_packed_position_ids = []
     sample_lens = []
 
     seq_offset = 0
     for b in range(batch_size):
-        # Text tokens: get valid length from mask
+        segments: list[torch.Tensor] = []
+        und_indices: list[int] = []
+        gen_indices: list[int] = []
+        pos_ids: list[torch.Tensor] = []
+        cursor = 0
+        pos_counter = 0
+
+        # --- Condition VAE tokens (gen MoE) ---
+        if cond_vae_embeds is not None:
+            n_cv = cond_vae_embeds.shape[1]
+            segments.append(cond_vae_embeds[b])
+            gen_indices.extend(range(seq_offset + cursor, seq_offset + cursor + n_cv))
+            pos_ids.append(torch.full((n_cv,), pos_counter, device=device, dtype=torch.long))
+            cursor += n_cv
+            pos_counter += 1
+
+        # --- Condition ViT tokens (und MoE) ---
+        if cond_vit_embeds is not None:
+            n_vit = cond_vit_embeds.shape[1]
+            segments.append(cond_vit_embeds[b])
+            und_indices.extend(range(seq_offset + cursor, seq_offset + cursor + n_vit))
+            pos_ids.append(torch.full((n_vit,), pos_counter, device=device, dtype=torch.long))
+            cursor += n_vit
+            pos_counter += 1
+
+        # --- Text tokens (und MoE) ---
         text_len = int(prompt_embeds_mask[b].sum().item())
-        text_embeds_b = prompt_embeds[b, :text_len]  # (text_len, D)
+        text_embeds_b = prompt_embeds[b, :text_len]
+        segments.append(text_embeds_b)
+        und_indices.extend(range(seq_offset + cursor, seq_offset + cursor + text_len))
+        pos_ids.append(torch.arange(pos_counter, pos_counter + text_len, device=device))
+        cursor += text_len
+        pos_counter += text_len
 
-        # Latent tokens
-        latent_b = x_t[b]  # (num_latent_tokens, patch_dim)
-        t_b = timestep[b:b + 1].expand(num_latent_tokens)  # (num_latent_tokens,)
-
-        # Compute VAE position IDs
+        # --- Noisy latent tokens (gen MoE) ---
+        latent_b = x_t[b]
+        t_b = timestep[b:b + 1].expand(num_latent_tokens)
         vae_position_ids = get_flattened_position_ids(
             height, width, latent_downsample, max_latent_size
         ).to(device)
-
-        # Embed noisy latent: vae2llm(x_t) + timestep_embed + position_embed
-        packed_timestep_embeds = module.time_embedder(t_b)  # (num_latent_tokens, D)
-        packed_pos_embed = module.latent_pos_embed(vae_position_ids)  # (num_latent_tokens, D)
-        latent_embeds = module.vae2llm(latent_b) + packed_timestep_embeds + packed_pos_embed
-
-        # Pack: text first, then latent
-        total_len = text_len + num_latent_tokens
-        packed_seq = torch.zeros(total_len, hidden_size, device=device, dtype=text_embeds_b.dtype)
-        packed_seq[:text_len] = text_embeds_b
-        packed_seq[text_len:] = latent_embeds.to(text_embeds_b.dtype)
-
-        # Track indexes (global offset)
-        text_indexes = torch.arange(seq_offset, seq_offset + text_len, device=device)
-        vae_indexes = torch.arange(
-            seq_offset + text_len, seq_offset + total_len, device=device
+        latent_embeds = (
+            module.vae2llm(latent_b)
+            + module.time_embedder(t_b)
+            + module.latent_pos_embed(vae_position_ids)
         )
+        segments.append(latent_embeds.to(text_embeds_b.dtype))
+        latent_global_start = seq_offset + cursor
+        gen_indices.extend(range(latent_global_start, latent_global_start + num_latent_tokens))
+        pos_ids.append(torch.full((num_latent_tokens,), pos_counter, device=device, dtype=torch.long))
+        cursor += num_latent_tokens
 
-        # Position IDs: text tokens get sequential IDs, latent tokens share
-        # a single rope position (consistent with Bagel's packing)
-        text_position_ids = torch.arange(text_len, device=device)
-        max_text_pos = text_len
-        latent_position_ids = torch.full(
-            (num_latent_tokens,), max_text_pos, device=device, dtype=torch.long
-        )
-        position_ids = torch.cat([text_position_ids, latent_position_ids])
-
+        # --- Assemble ---
+        packed_seq = torch.cat(segments, dim=0)
         all_packed_sequences.append(packed_seq)
-        all_packed_text_indexes.append(text_indexes)
-        all_packed_vae_token_indexes.append(vae_indexes)
-        all_packed_position_ids.append(position_ids)
-        sample_lens.append(total_len)
-        seq_offset += total_len
+        all_packed_und_indexes.append(torch.tensor(und_indices, device=device, dtype=torch.long))
+        all_packed_gen_indexes.append(torch.tensor(gen_indices, device=device, dtype=torch.long))
+        all_packed_latent_indexes.append(
+            torch.arange(latent_global_start, latent_global_start + num_latent_tokens, device=device)
+        )
+        all_packed_position_ids.append(torch.cat(pos_ids))
+        sample_lens.append(cursor)
+        seq_offset += cursor
 
-    # Concatenate across batch
     packed_sequence = torch.cat(all_packed_sequences, dim=0)
-    packed_text_indexes = torch.cat(all_packed_text_indexes, dim=0)
-    packed_vae_token_indexes = torch.cat(all_packed_vae_token_indexes, dim=0)
+    packed_und_indexes = torch.cat(all_packed_und_indexes, dim=0)
+    packed_gen_indexes = torch.cat(all_packed_gen_indexes, dim=0)
+    packed_latent_indexes = torch.cat(all_packed_latent_indexes, dim=0)
     packed_position_ids = torch.cat(all_packed_position_ids, dim=0)
 
     model_inputs = {
         "packed_sequence": packed_sequence,
-        "packed_text_indexes": packed_text_indexes,
-        "packed_vae_token_indexes": packed_vae_token_indexes,
+        "packed_und_indexes": packed_und_indexes,
+        "packed_gen_indexes": packed_gen_indexes,
+        "packed_latent_indexes": packed_latent_indexes,
         "packed_position_ids": packed_position_ids,
         "sample_lens": sample_lens,
         "use_moe": use_moe,
@@ -240,8 +261,9 @@ def _bagel_flow_forward(module, model_inputs: dict) -> torch.Tensor:
         Velocity prediction tensor of shape (B, num_latent_tokens, patch_dim).
     """
     packed_sequence = model_inputs["packed_sequence"]
-    packed_text_indexes = model_inputs["packed_text_indexes"]
-    packed_vae_token_indexes = model_inputs["packed_vae_token_indexes"]
+    packed_und_indexes = model_inputs["packed_und_indexes"]
+    packed_gen_indexes = model_inputs["packed_gen_indexes"]
+    packed_latent_indexes = model_inputs["packed_latent_indexes"]
     packed_position_ids = model_inputs["packed_position_ids"]
     sample_lens = model_inputs["sample_lens"]
     use_moe = model_inputs["use_moe"]
@@ -250,12 +272,10 @@ def _bagel_flow_forward(module, model_inputs: dict) -> torch.Tensor:
     extra_inputs = {}
     if use_moe:
         extra_inputs = dict(
-            packed_und_token_indexes=packed_text_indexes,
-            packed_gen_token_indexes=packed_vae_token_indexes,
+            packed_und_token_indexes=packed_und_indexes,
+            packed_gen_token_indexes=packed_gen_indexes,
         )
 
-    # Run the LLM forward. We use the Qwen2ForCausalLM.model (Qwen2Model)
-    # directly since we already have the embeddings.
     last_hidden_state = module.language_model.model(
         packed_sequence=packed_sequence,
         sample_lens=sample_lens,
@@ -264,10 +284,8 @@ def _bagel_flow_forward(module, model_inputs: dict) -> torch.Tensor:
         **extra_inputs,
     )
 
-    # Project latent token outputs to VAE space
-    v_t = module.llm2vae(last_hidden_state[packed_vae_token_indexes])
+    v_t = module.llm2vae(last_hidden_state[packed_latent_indexes])
 
-    # Reshape to (B, num_latent_tokens, patch_dim)
     batch_size = len(sample_lens)
     v_t = v_t.reshape(batch_size, num_latent_tokens, -1)
 
@@ -305,31 +323,14 @@ class BagelFlowGRPO(DiffusionModelBase):
         Returns:
             The loaded BagelForConditionalGeneration module.
         """
-        try:
-            from transformers import AutoModelForCausalLM
+        from transformers import AutoModelForCausalLM
 
-            model = AutoModelForCausalLM.from_pretrained(
-                model_config.local_path,
-                torch_dtype=torch_dtype,
-                trust_remote_code=True,
-            )
-            return model
-        except Exception:
-            logger.warning(
-                "Failed to load Bagel via AutoModelForCausalLM. "
-                "Falling back to direct BagelForConditionalGeneration import."
-            )
-            # Try direct import from the VeOmni Bagel model
-            from veomni.models.transformers.bagel.modeling_bagel import BagelForConditionalGeneration
-            from veomni.models.transformers.bagel.configuration_bagel import BagelConfig as BagelModelConfig
-
-            config = BagelModelConfig.from_pretrained(model_config.local_path)
-            model = BagelForConditionalGeneration.from_pretrained(
-                model_config.local_path,
-                config=config,
-                torch_dtype=torch_dtype,
-            )
-            return model
+        model = AutoModelForCausalLM.from_pretrained(
+            model_config.local_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
+        return model
 
     @classmethod
     def build_scheduler(cls, model_config: DiffusionModelConfig) -> FlowMatchSDEDiscreteScheduler:
@@ -382,9 +383,8 @@ class BagelFlowGRPO(DiffusionModelBase):
     ) -> tuple[dict, Optional[dict]]:
         """Build Bagel-specific inputs for the flow-matching forward pass.
 
-        For Bagel, we construct the packed sequence with text embeddings and
-        noisy VAE latent tokens. The ``latents`` tensor contains patchified
-        VAE latents from the rollout trajectory.
+        For Bagel, we construct the packed sequence with optional condition
+        embeddings (i2i), text embeddings, and noisy VAE latent tokens.
 
         Args:
             module: The BagelForConditionalGeneration model.
@@ -398,6 +398,7 @@ class BagelFlowGRPO(DiffusionModelBase):
             negative_prompt_embeds: Negative prompt embeddings (unused for Bagel).
             negative_prompt_embeds_mask: Attention mask for negative embeddings.
             micro_batch: Micro-batch with metadata (height, width, etc.).
+                May contain ``cond_vae_embeds`` and ``cond_vit_embeds`` for i2i.
             step: Current denoising step index.
 
         Returns:
@@ -406,21 +407,22 @@ class BagelFlowGRPO(DiffusionModelBase):
         """
         # Select the current step from the trajectory
         if latents.ndim == 4:
-            # (B, T, num_tokens, patch_dim) -> (B, num_tokens, patch_dim)
             x_t = latents[:, step]
         else:
             x_t = latents
 
         if timesteps.ndim == 2:
-            # (B, T) -> (B,)
             t = timesteps[:, step]
         else:
             t = timesteps
 
         # Bagel timesteps are in [0, 1] (sigma space), not in [0, 1000].
-        # If the scheduler returns timesteps in [0, 1000], normalize them.
         if t.max() > 1.0:
             t = t / 1000.0
+
+        # Extract condition embeddings for i2i (if present in micro_batch)
+        cond_vae_embeds = micro_batch.get("cond_vae_embeds", None)
+        cond_vit_embeds = micro_batch.get("cond_vit_embeds", None)
 
         model_inputs = _build_bagel_model_forward_inputs(
             module=module,
@@ -429,10 +431,11 @@ class BagelFlowGRPO(DiffusionModelBase):
             prompt_embeds=prompt_embeds,
             prompt_embeds_mask=prompt_embeds_mask,
             micro_batch=micro_batch,
+            cond_vae_embeds=cond_vae_embeds,
+            cond_vit_embeds=cond_vit_embeds,
         )
 
-        # Bagel does not use CFG during training (only during inference with
-        # separate KV caches). Return None for negative inputs.
+        # Bagel does not use CFG during training.
         return model_inputs, None
 
     @classmethod

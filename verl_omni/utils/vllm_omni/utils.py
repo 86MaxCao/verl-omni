@@ -126,10 +126,9 @@ class VLLMOmniHijack:
 
         def hijack_load_model(
             self,
-            od_config: OmniDiffusionConfig,
             load_device: str,
             load_format: str | None = "default",
-            custom_pipeline_name: str | None = None,
+            custom_pipeline_name: str | type | None = None,
             device: torch.device | None = None,
         ):
             """
@@ -151,7 +150,7 @@ class VLLMOmniHijack:
             """
             if load_format is None:
                 load_format = "default"
-            self.od_config = od_config
+            od_config = self.od_config
             # CPU offload + FP8: load weights on device for FP8 quantization
             if load_device == "cpu" and od_config.quantization_config is not None:
                 load_device = device.type
@@ -161,7 +160,6 @@ class VLLMOmniHijack:
             with set_default_torch_dtype(od_config.dtype):
                 if od_config.parallel_config.use_hsdp:
                     model = self._load_model_with_hsdp(
-                        od_config,
                         target_device=device,
                         load_format=load_format,
                         custom_pipeline_name=custom_pipeline_name,
@@ -186,8 +184,8 @@ class VLLMOmniHijack:
                 logger.debug("Loading weights on %s ...", load_device)
                 if load_format == "diffusers":
                     cast(DiffusersAdapterPipeline, model).load_weights()
-                elif self._is_gguf_quantization(od_config):
-                    self._load_weights_with_gguf(model, od_config)
+                elif self._is_gguf_quantization():
+                    self._load_weights_with_gguf(model)
                 else:
                     self.load_weights(model)
 
@@ -235,7 +233,10 @@ class VLLMOmniHijack:
         hijack_omni_diffusion_config_post_init._warned = False
 
         do_hijack(DiffusionLoRAManager, "_load_adapter", hijack__load_adapter)
-        do_hijack(DiffusersPipelineLoader, "load_model", hijack_load_model)
+        # NOTE: hijack_load_model was needed for older vllm-omni where custom_pipeline
+        # loading didn't handle CPU-first allocation. Upstream now has _init_from_load_format()
+        # with the same fix, so the hijack is no longer needed (and breaks the new API).
+        # do_hijack(DiffusersPipelineLoader, "load_model", hijack_load_model)
         if not getattr(OmniDiffusionConfig, "_verl_omni_master_port_hijacked", False):
             do_hijack(OmniDiffusionConfig, "__post_init__", hijack_omni_diffusion_config_post_init)
             OmniDiffusionConfig._verl_omni_master_port_hijacked = True
